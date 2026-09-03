@@ -953,6 +953,16 @@ static mrb_task*
 task_create_common(mrb_state *mrb, const struct RProc *proc,
                    mrb_value name, uint8_t priority)
 {
+  /* Every task is born here - Task.new, mrb_create_task, the C API - so
+     this is the one place a disabled VM has to say no. A task made in a
+     VM the dispatch loop no longer checks would never be preempted and
+     never be switched away from: a hang, arriving later and somewhere
+     else. mrb_task_disable() refuses when tasks already exist for the
+     same reason, from the other side. */
+  if (!mrb->task.enabled) {
+    mrb_raise(mrb, E_RUNTIME_ERROR, "tasks are disabled for this mrb_state");
+  }
+
   mrb_task *t = task_alloc(mrb);
   t->priority = priority;
   t->status = MRB_TASK_STATUS_READY;

@@ -431,6 +431,23 @@ assert("closure escaping a synchronously executed proc survives GC") do
   $task_escaped_proc3 = nil
 end
 
+assert('a disabled VM refuses to make a task') do
+  # The VM under test has tasks, so it cannot be disabled here - what can
+  # be checked is the other half: TaskTest.with_tasks_disabled runs a
+  # block with the flag off, and Task.new must refuse rather than build
+  # something nothing will ever schedule.
+  raised = false
+  TaskTest.with_tasks_disabled do
+    begin
+      Task.new { 1 }
+    rescue RuntimeError
+      raised = true
+    end
+  end
+  assert_true raised, 'Task.new was allowed in a disabled VM'
+  assert_true TaskTest.tasks_enabled?, 'the flag was not put back'
+end
+
 assert('mrb_task_disable refuses a VM that already has tasks') do
   # A queue nobody ticks is a hang, not a saving, so the switch is only
   # for a VM that has never had one. This VM has, so it must refuse - and
