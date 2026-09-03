@@ -14,6 +14,8 @@
 #include <mruby/proc.h>
 #include <mruby/variable.h>
 #include <mruby/gc.h>
+#include <mruby/range.h>
+#include <mruby/error.h>
 #include <mruby/internal.h>
 
 #ifndef MRB_PRESYM_SCANNING
@@ -198,7 +200,9 @@ sym_check(mrb_state *mrb, const char *name, size_t len, mrb_sym i)
   }
   else {
     /* length in BER */
-    symlen = mrb_packed_int_decode((const uint8_t*)symname, (const uint8_t**)&symname);
+    const uint8_t *p = (const uint8_t*)symname;
+    symlen = mrb_packed_int_decode(p, &p);
+    symname = (const char*)p;
   }
   if (len == symlen && memcmp(symname, name, len) == 0) {
     return TRUE;
@@ -293,6 +297,7 @@ migrate_to_hash_table(mrb_state *mrb)
   /* Rebuild hash table from existing linear data */
   for (i = 1; i <= mrb->symidx; i++) {
     const char *tagged_ptr = mrb->symtbl[i];
+    if (tagged_ptr == NULL) continue;  /* skip tombstones */
     const char *name = symtbl_get_ptr(tagged_ptr);
     size_t len;
     uint8_t hash;
@@ -303,7 +308,9 @@ migrate_to_hash_table(mrb_state *mrb)
     }
     else {
       /* This is a packed length string */
-      len = mrb_packed_int_decode((const uint8_t*)name, (const uint8_t**)&name);
+      const uint8_t *p = (const uint8_t*)name;
+      len = mrb_packed_int_decode(p, &p);
+      name = (const char*)p;
     }
 
     hash = mrb_byte_hash((const uint8_t*)name, len);
@@ -633,7 +640,9 @@ sym2name_len(mrb_state *mrb, mrb_sym sym, char *buf, mrb_int *lenp)
   const char *symname = symtbl_get_ptr(tagged_ptr);  /* Untag for access */
 
   if (!symtbl_is_literal(tagged_ptr)) {
-    uint32_t len = mrb_packed_int_decode((const uint8_t*)symname, (const uint8_t**)&symname);
+    const uint8_t *p = (const uint8_t*)symname;
+    uint32_t len = mrb_packed_int_decode(p, &p);
+    symname = (const char*)p;
     if (lenp) *lenp = (mrb_int)len;
   }
   else if (lenp) {
@@ -662,6 +671,29 @@ mrb_sym_name_len(mrb_state *mrb, mrb_sym sym, mrb_int *lenp)
   return sym2name_len(mrb, sym, NULL, lenp);
 #else
   return sym2name_len(mrb, sym, mrb->symbuf, lenp);
+#endif
+}
+
+/*
+ * Tells whether symbol GC may free the buffer holding the symbol's name.
+ *
+ * Only dynamic symbols own an individual allocation. Inline symbols carry
+ * their name in the value, presym names are static data and literal names
+ * come from the symbol pool, so none of those is ever freed and a string
+ * may share them.
+ */
+static mrb_bool
+sym_name_freeable_p(mrb_state *mrb, mrb_sym sym)
+{
+#if MRB_SYMBOL_MAX > 0
+  if (SYMBOL_INLINE_P(sym)) return FALSE;
+  if (sym <= MRB_PRESYM_MAX) return FALSE;
+  sym -= MRB_PRESYM_MAX;
+  if (sym > mrb->symidx) return FALSE;
+  return (mrb->sym_flags[sym] & SYM_FL_DYNAMIC) != 0;
+#else
+  (void)mrb; (void)sym;
+  return FALSE;
 #endif
 }
 
@@ -710,6 +742,31 @@ sym_gc_mark_hash_entry(mrb_state *mrb, mrb_value key, mrb_value val, void *p)
   if (mrb_symbol_p(key)) sym_gc_mark(mrb, mrb_symbol(key));
   if (mrb_symbol_p(val)) sym_gc_mark(mrb, mrb_symbol(val));
   return 0;
+}
+
+/* `sym_gc_mark_object` reaches a suspended fiber, whose stack this walks. */
+static void sym_gc_mark_context(mrb_state *mrb, struct mrb_context *c);
+
+/* Mark the symbols an irep holds: the pool the bytecode loads them from, the
+   local variable names, and the same for every irep nested inside it.  An
+   irep is not an object, so the sweep below never reaches one on its own, and
+   a symbol whose only holder is bytecode that has not run yet would be freed
+   out from under the instruction that is going to load it. */
+static void
+sym_gc_mark_irep(mrb_state *mrb, const mrb_irep *irep)
+{
+  if (irep == NULL) return;
+  for (int i = 0; i < irep->slen; i++) {
+    sym_gc_mark(mrb, irep->syms[i]);
+  }
+  if (irep->lv) {
+    for (int i = 0; i + 1 < irep->nlocals; i++) {
+      sym_gc_mark(mrb, irep->lv[i]);
+    }
+  }
+  for (int i = 0; i < irep->rlen; i++) {
+    sym_gc_mark_irep(mrb, irep->reps[i]);
+  }
 }
 
 /* Mark symbols from a single object */
@@ -762,6 +819,44 @@ sym_gc_mark_object(mrb_state *mrb, struct RBasic *obj, void *data)
   case MRB_TT_HASH:
     mrb_iv_foreach(mrb, mrb_obj_value(obj), sym_gc_mark_iv, NULL);
     mrb_hash_foreach(mrb, (struct RHash*)obj, sym_gc_mark_hash_entry, NULL);
+    break;
+  case MRB_TT_PROC:
+    {
+      struct RProc *p = (struct RProc*)obj;
+      if (MRB_PROC_ALIAS_P(p)) {
+        /* an alias keeps a method name where a proc keeps its irep */
+        sym_gc_mark(mrb, p->body.mid);
+      }
+      else if (!MRB_PROC_CFUNC_P(p)) {
+        sym_gc_mark_irep(mrb, p->body.irep);
+      }
+    }
+    break;
+  case MRB_TT_FIBER:
+    {
+      /* A suspended fiber's stack is a root of its own; `mrb_symbol_gc`
+         reaches only the current and the root context. */
+      struct mrb_context *c = ((struct RFiber*)obj)->cxt;
+      if (c && c != mrb->root_c && c != mrb->c &&
+          c->status != MRB_FIBER_TERMINATED) {
+        sym_gc_mark_context(mrb, c);
+      }
+    }
+    break;
+  case MRB_TT_RANGE:
+    {
+      struct RRange *r = (struct RRange*)obj;
+      if (RANGE_INITIALIZED_P(r)) {
+        if (mrb_symbol_p(RANGE_BEG(r))) sym_gc_mark(mrb, mrb_symbol(RANGE_BEG(r)));
+        if (mrb_symbol_p(RANGE_END(r))) sym_gc_mark(mrb, mrb_symbol(RANGE_END(r)));
+      }
+    }
+    break;
+  case MRB_TT_BREAK:
+    {
+      mrb_value v = mrb_break_value_get((struct RBreak*)obj);
+      if (mrb_symbol_p(v)) sym_gc_mark(mrb, mrb_symbol(v));
+    }
     break;
   default:
     break;
@@ -817,10 +912,10 @@ mrb_symbol_gc(mrb_state *mrb)
     sym_gc_mark_context(mrb, mrb->c);
   }
 
-  /* Mark symbols from global variable table */
-  if (mrb->globals) {
-    mrb_iv_foreach(mrb, mrb_obj_value(mrb->object_class), sym_gc_mark_iv, NULL);
-  }
+  /* Mark symbols from global variable table.
+     `mrb->globals` is a table of its own, not the instance variables of
+     `Object`; walking the latter reaches none of the global names. */
+  mrb_gv_foreach(mrb, sym_gc_mark_iv, NULL);
 
   /* Phase 3: sweep unmarked dynamic symbols */
   mrb_sym freed = 0;
@@ -849,7 +944,9 @@ mrb_symbol_gc(mrb_state *mrb)
         len = strlen(name);
       }
       else {
-        len = mrb_packed_int_decode((const uint8_t*)name, (const uint8_t**)&name);
+        const uint8_t *p = (const uint8_t*)name;
+        len = mrb_packed_int_decode(p, &p);
+        name = (const char*)p;
       }
       uint8_t hash = mrb_byte_hash((const uint8_t*)name, len);
       if (ht->buckets[hash] != 0) {
@@ -970,7 +1067,7 @@ sym_name(mrb_state *mrb, mrb_value vsym)
   const char *name = mrb_sym_name_len(mrb, sym, &len);
 
   mrb_assert(name != NULL);
-  if (SYMBOL_INLINE_P(sym)) {
+  if (SYMBOL_INLINE_P(sym) || sym_name_freeable_p(mrb, sym)) {
     return mrb_str_new_frozen(mrb, name, len);
   }
   return mrb_str_new_static_frozen(mrb, name, len);
@@ -1134,7 +1231,7 @@ sym_inspect(mrb_state *mrb, mrb_value sym)
     sp[1] = '"';
   }
 #ifdef MRB_UTF8_STRING
-  if (SYMBOL_INLINE_P(id)) RSTR_SET_ASCII_FLAG(mrb_str_ptr(str));
+  if (SYMBOL_INLINE_P(id)) RSTR_CODERANGE_SET(mrb_str_ptr(str), MRB_STR_CODERANGE_7BIT);
 #endif
   return str;
 }
@@ -1146,7 +1243,8 @@ sym_inspect(mrb_state *mrb, mrb_value sym)
  * sym: The symbol to convert.
  *
  * Returns the mruby string value corresponding to the symbol.
- * If the symbol is an inline symbol, a new string is created.
+ * The name is copied for an inline symbol and for a dynamic symbol, whose
+ * name buffer symbol GC may free while the string is still alive.
  * Otherwise, a static string (sharing the symbol's name buffer) is returned.
  * Returns an undefined value if the symbol is invalid (though this should not happen).
  */
@@ -1159,8 +1257,11 @@ mrb_sym_str(mrb_state *mrb, mrb_sym sym)
   if (!name) return mrb_undef_value(); /* can't happen */
   if (SYMBOL_INLINE_P(sym)) {
     mrb_value str = mrb_str_new(mrb, name, len);
-    RSTR_SET_ASCII_FLAG(mrb_str_ptr(str));
+    RSTR_CODERANGE_SET(mrb_str_ptr(str), MRB_STR_CODERANGE_7BIT);
     return str;
+  }
+  if (sym_name_freeable_p(mrb, sym)) {
+    return mrb_str_new(mrb, name, len);
   }
   return mrb_str_new_static(mrb, name, len);
 }

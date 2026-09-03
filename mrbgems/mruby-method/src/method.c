@@ -18,9 +18,8 @@ args_shift(mrb_state *mrb)
 
   if (ci->n < 15) {
     if (ci->n == 0) { goto argerr; }
-    mrb_assert(ci->nk == 0 || ci->nk == 15);
     mrb_value obj = argv[0];
-    int count = ci->n + (ci->nk == 0 ? 0 : 1) + 1 /* block */ - 1 /* first value */;
+    int count = ci->n + ci->kw + 1 /* block */ - 1 /* first value */;
     memmove(argv, argv + 1, count * sizeof(mrb_value));
     ci->n--;
     return obj;
@@ -38,28 +37,8 @@ args_shift(mrb_state *mrb)
 static void
 args_unshift(mrb_state *mrb, mrb_value obj)
 {
-  mrb_callinfo *ci = mrb->c->ci;
-  mrb_value *argv = ci->stack + 1;
-
-  if (ci->n < 15) {
-    mrb_assert(ci->nk == 0 || ci->nk == 15);
-    mrb_value args = mrb_ary_new_from_values(mrb, ci->n, argv);
-    if (ci->nk == 0) {
-      mrb_value block = argv[ci->n];
-      argv[0] = args;
-      argv[1] = block;
-    }
-    else {
-      mrb_value keyword = argv[ci->n];
-      mrb_value block = argv[ci->n + 1];
-      argv[0] = args;
-      argv[1] = keyword;
-      argv[2] = block;
-    }
-    ci->n = 15;
-  }
-
-  mrb_ary_unshift(mrb, *argv, obj);
+  mrb_value args = mrb_args_pack_positional(mrb);
+  mrb_ary_unshift(mrb, args, obj);
 }
 
 static const struct RProc*
@@ -602,7 +581,7 @@ method_to_s(mrb_state *mrb, mrb_value self)
   if (!mrb_nil_p(proc)) {
     const struct RProc *p = mrb_proc_ptr(proc);
     if (MRB_PROC_ALIAS_P(p)) {
-      mrb_sym mid;
+      mrb_sym mid = 0;
       while (MRB_PROC_ALIAS_P(p)) {
         mid = p->body.mid;
         p = p->upper;

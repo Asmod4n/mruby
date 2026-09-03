@@ -30,17 +30,41 @@ struct REnv {
   mrb_sym mid;
 };
 
-/* flags (20bits): 1(ZERO):1(separate module):2(visibility):8(cioff/bidx):8(stack_len) */
+/* flags (20bits): 1(module_function):1(visibility break):2(visibility):1(svar):7(bidx):8(stack_len)
+ * The bit above the block argument index says whether the heap stack of a
+ * closed env carries the special-variable slot past its locals; it is an
+ * implementation detail of the core, so its accessors live in
+ * mruby/internal.h (MRB_ENV_SVAR_P) rather than here.
+ * The index range is 1..16. See also mrb_env_new(). */
 #define MRB_ENV_SET_LEN(e,len) ((e)->flags = (((e)->flags & ~0xff)|((unsigned int)(len) & 0xff)))
 #define MRB_ENV_LEN(e) ((mrb_int)((e)->flags & 0xff))
 #define MRB_ENV_CLOSE(e) ((e)->cxt = NULL)
 #define MRB_ENV_ONSTACK_P(e) ((e)->cxt != NULL)
-#define MRB_ENV_BIDX(e) (((e)->flags >> 8) & 0xff)
-#define MRB_ENV_SET_BIDX(e,idx) ((e)->flags = (((e)->flags & ~(0xff<<8))|((unsigned int)(idx) & 0xff)<<8))
+#define MRB_ENV_BIDX(e) MRB_FLAGS_GET((e)->flags, 8, 7)
+/* MRB_FLAGS_SET() masks to the width, so an index that does not fit is
+   stored truncated rather than reaching the flag above it. That is silent,
+   and this macro is public and was eight bits wide before, so a debug build
+   says so instead. The tighter bound the VM itself works to, 43, is
+   asserted where the VM computes the index (mrb_env_new()).
+   A static inline function rather than a bare macro: mrb_assert() expands
+   to nothing under release, so a macro body using it evaluates idx once in
+   release and twice under MRB_DEBUG, which a public macro cannot ask a
+   caller to plan around. */
+static inline void
+mrb_env_set_bidx(struct REnv *e, unsigned int idx)
+{
+  mrb_assert(idx < 128);
+  MRB_FLAGS_SET(e->flags, 8, 7, idx);
+}
+#define MRB_ENV_SET_BIDX(e, idx) mrb_env_set_bidx((e), (unsigned int)(idx))
 #define MRB_ENV_SET_VISIBILITY(e, vis) MRB_FLAGS_SET((e)->flags, 16, 2, vis)
 #define MRB_ENV_VISIBILITY(e) MRB_FLAGS_GET((e)->flags, 16, 2)
 #define MRB_ENV_VISIBILITY_BREAK_P(e) MRB_FLAG_CHECK((e)->flags, 18)
-#define MRB_ENV_COPY_FLAGS_FROM_CI(e, ci) MRB_FLAGS_SET((e)->flags, 16, 3, (ci)->vis)
+#define MRB_ENV_MODFUNC_P(e) MRB_FLAG_CHECK((e)->flags, 19)
+#define MRB_ENV_SET_MODFUNC(e) MRB_FLAG_ON((e)->flags, 19)
+#define MRB_ENV_CLEAR_MODFUNC(e) MRB_FLAG_OFF((e)->flags, 19)
+/* copies visibility (2) + visibility-break (1) + module_function (1) = 4 bits */
+#define MRB_ENV_COPY_FLAGS_FROM_CI(e, ci) MRB_FLAGS_SET((e)->flags, 16, 4, (ci)->vis)
 
 /*
  * Returns TRUE on success.
@@ -182,6 +206,13 @@ MRB_API mrb_value mrb_proc_cfunc_env_get(mrb_state *mrb, mrb_int idx);
 #define MRB_METHOD_PROC_P(m) (!MRB_METHOD_FUNC_P(m))
 #define MRB_METHOD_PROC(m) ((m).as.proc)
 #define MRB_METHOD_UNDEF_P(m) ((m).as.proc==NULL)
+/* A method whose body is `mrb_notimplement_m` stands for a feature the build
+   does not have (`IO#pread` where there is no pread(2), etc.). It is defined,
+   so it is listed and can be taken as a `Method`, but `respond_to?` answers
+   false for it, as CRuby does for a method defined with `rb_f_notimplement`.
+   The body is the mark: a table entry in ROM cannot be written at startup,
+   and no flag bit is spent. */
+#define MRB_METHOD_NOTIMPL_P(m) (MRB_METHOD_FUNC_P(m) && MRB_METHOD_FUNC(m)==mrb_notimplement_m)
 #define MRB_METHOD_VISIBILITY(m) ((m).flags & MRB_METHOD_VISIBILITY_MASK)
 #define MRB_SET_VISIBILITY_FLAGS(f,v) ((f)=(((f)&~MRB_METHOD_VISIBILITY_MASK)|(v)))
 #define MRB_METHOD_SET_VISIBILITY(m,v) MRB_SET_VISIBILITY_FLAGS((m).flags,(v))

@@ -7,7 +7,11 @@
 #ifndef MRUBY_BOXING_WORD_H
 #define MRUBY_BOXING_WORD_H
 
-#if defined(MRB_32BIT) && !defined(MRB_USE_FLOAT32) && !defined(MRB_WORDBOX_NO_INLINE_FLOAT)
+/* Floats are not inlined where a double does not fit beside the tag, nor where
+   there are no floats to inline. The tag layout below and mrb_type() both ask
+   that one question, so it is answered once, here. */
+#if !defined(MRB_WORDBOX_NO_INLINE_FLOAT) && \
+    (defined(MRB_NO_FLOAT) || (defined(MRB_32BIT) && !defined(MRB_USE_FLOAT32)))
 # define MRB_WORDBOX_NO_INLINE_FLOAT
 #endif
 
@@ -79,7 +83,7 @@ enum mrb_special_consts {
 #define WORDBOX_FIXNUM_FLAG     (1 << (WORDBOX_FIXNUM_BIT_POS - 1))
 #define WORDBOX_FIXNUM_MASK     ((1 << WORDBOX_FIXNUM_BIT_POS) - 1)
 
-#if defined(MRB_WORDBOX_NO_INLINE_FLOAT) || defined(MRB_NO_FLOAT)
+#ifdef MRB_WORDBOX_NO_INLINE_FLOAT
 /* floats are allocated in heaps */
 #define WORDBOX_IMMEDIATE_MASK  0x03
 #define WORDBOX_SYMBOL_BIT_POS  2
@@ -125,7 +129,7 @@ enum mrb_special_consts {
  *
  * 64-bit word with inline float32 (MRB_USE_FLOAT32):
  *   float : ...FFFF FF10 (float32 shifted left by 2)
- *   (other values same as above)
+ *   (other values same as above; a NaN is heap-allocated as RFloat)
  *
  * word boxing without inline float (MRB_WORDBOX_NO_INLINE_FLOAT):
  *   nil   : ...0000 0000 (all bits are 0)
@@ -207,10 +211,9 @@ mrb_integer_func(mrb_value o) {
 #ifndef MRB_NO_FLOAT
 #ifdef MRB_WORDBOX_NO_INLINE_FLOAT
 #define mrb_float_p(o) WORDBOX_OBJ_TYPE_P(o, FLOAT)
-#elif defined(MRB_USE_FLOAT32) && defined(MRB_64BIT)
-#define mrb_float_p(o) WORDBOX_SHIFT_VALUE_P(o, FLOAT)
 #else
-/* rotation encoding: most floats inline, edge cases on heap */
+/* most floats inline; a NaN is always on the heap, and the rotation encoding
+   sends its edge cases there too */
 #define mrb_float_p(o) (WORDBOX_SHIFT_VALUE_P(o, FLOAT) || WORDBOX_OBJ_TYPE_P(o, FLOAT))
 #endif
 #else
@@ -249,17 +252,46 @@ mrb_integer_func(mrb_value o) {
 #define SET_SYM_VALUE(r,n) WORDBOX_SET_SHIFT_VALUE(r, SYMBOL, n)
 #define SET_OBJ_VALUE(r,v) ((r).w = (uintptr_t)(v))
 
-MRB_INLINE enum mrb_vtype
-mrb_type(mrb_value o)
-{
-  return !mrb_bool(o)    ? MRB_TT_FALSE :
-         mrb_true_p(o)   ? MRB_TT_TRUE :
-         mrb_fixnum_p(o) ? MRB_TT_INTEGER :
-         mrb_symbol_p(o) ? MRB_TT_SYMBOL :
-         mrb_undef_p(o)  ? MRB_TT_UNDEF :
-         mrb_float_p(o)  ? MRB_TT_FLOAT :
-         mrb_val_union(o).bp->tt;
+#ifndef MRB_WORDBOX_NO_INLINE_FLOAT
+MRB_INLINE enum mrb_vtype mrb_type(mrb_value o) {
+  static const enum mrb_vtype lut1[4] = {MRB_TT_MAXDEFINE, MRB_TT_INTEGER,
+                                         MRB_TT_FLOAT, MRB_TT_INTEGER};
+  static const enum mrb_vtype lut3[4] = {MRB_TT_FALSE, MRB_TT_TRUE,
+                                         MRB_TT_UNDEF, MRB_TT_SYMBOL};
+  if (o.w == MRB_Qnil)
+    return MRB_TT_FALSE;
+  enum mrb_vtype tt = lut1[o.w & 0x3];
+  if (tt != MRB_TT_MAXDEFINE)
+    return tt;
+  if (o.w & 0x4)
+    return lut3[(o.w >> 3) & 0x3];
+
+  return mrb_val_union(o).bp->tt;
 }
+#else
+MRB_INLINE enum mrb_vtype mrb_type(mrb_value o) {
+  static const enum mrb_vtype lut1[4] = {MRB_TT_MAXDEFINE, MRB_TT_INTEGER,
+                                         MRB_TT_SYMBOL, MRB_TT_INTEGER};
+  static const enum mrb_vtype lut2[8] = {
+    MRB_TT_FALSE,
+    MRB_TT_FALSE,
+    MRB_TT_UNDEF, /* should never happen */
+    MRB_TT_TRUE,
+    MRB_TT_UNDEF, /* should never happen */
+    MRB_TT_UNDEF,
+    MRB_TT_UNDEF, /* should never happen */
+    MRB_TT_UNDEF, /* should never happen */
+  };
+  enum mrb_vtype tt = lut1[o.w & 0x3];
+  if (tt != MRB_TT_MAXDEFINE)
+    return tt;
+
+  if (o.w <= MRB_Qundef)
+    return lut2[o.w >> 2];
+
+  return mrb_val_union(o).bp->tt;
+}
+#endif
 
 MRB_INLINE enum mrb_vtype
 mrb_unboxed_type(mrb_value o)

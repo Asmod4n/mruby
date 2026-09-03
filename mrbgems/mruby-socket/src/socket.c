@@ -25,6 +25,7 @@
   typedef size_t fsize_t;
 #endif
 
+#include <limits.h>
 #include <string.h>
 
 #include <mruby.h>
@@ -184,6 +185,24 @@ free_addrinfo(mrb_state *mrb, mrb_value addrinfo)
  *   Addrinfo.getaddrinfo("localhost", "http")
  *   Addrinfo.getaddrinfo("www.example.com", 80, Socket::AF_INET)
  */
+static int
+getaddrinfo_hint(mrb_state *mrb, mrb_value val, const char *name)
+{
+  /* getaddrinfo() hint fields are C int; reject values that would not
+     survive the narrowing rather than silently truncating them (#6960).
+     A big integer outgrows mrb_int itself, so it never fits a C int either. */
+  if (mrb_bigint_p(val)) {
+    mrb_raisef(mrb, E_RANGE_ERROR, "getaddrinfo %s out of range: %v", name, val);
+  }
+  mrb_int v = mrb_integer(val);
+#if MRB_INT_MAX > INT_MAX
+  if (v < INT_MIN || v > INT_MAX) {
+    mrb_raisef(mrb, E_RANGE_ERROR, "getaddrinfo %s out of range: %v", name, val);
+  }
+#endif
+  return (int)v;
+}
+
 static mrb_value
 mrb_addrinfo_getaddrinfo(mrb_state *mrb, mrb_value klass)
 {
@@ -209,18 +228,21 @@ mrb_addrinfo_getaddrinfo(mrb_state *mrb, mrb_value klass)
     mrb_raise(mrb, E_TYPE_ERROR, "service must be String, Integer, or nil");
   }
 
-  hints.ai_flags = (int)flags;
+  hints.ai_flags = getaddrinfo_hint(mrb, mrb_int_value(mrb, flags), "flags");
 
-  if (mrb_integer_p(family)) {
-    hints.ai_family = (int)mrb_integer(family);
+  /* an out of range hint reaches here as a big integer wherever bigint is
+     built in, and `mrb_integer_p` alone would leave the field at its default
+     rather than report the value as out of range */
+  if (mrb_integer_p(family) || mrb_bigint_p(family)) {
+    hints.ai_family = getaddrinfo_hint(mrb, family, "family");
   }
 
-  if (mrb_integer_p(socktype)) {
-    hints.ai_socktype = (int)mrb_integer(socktype);
+  if (mrb_integer_p(socktype) || mrb_bigint_p(socktype)) {
+    hints.ai_socktype = getaddrinfo_hint(mrb, socktype, "socktype");
   }
 
-  if (mrb_integer_p(protocol)) {
-    hints.ai_protocol = (int)mrb_integer(protocol);
+  if (mrb_integer_p(protocol) || mrb_bigint_p(protocol)) {
+    hints.ai_protocol = getaddrinfo_hint(mrb, protocol, "protocol");
   }
 
   int error = getaddrinfo(hostname, servname, &hints, &addr);
@@ -337,6 +359,7 @@ socket_family(int s)
   return ss.ss_family;
 }
 
+#ifdef HAVE_GETPEEREID
 /*
  * call-seq:
  *   basicsocket.getpeereid -> [euid, egid]
@@ -349,7 +372,6 @@ socket_family(int s)
 static mrb_value
 mrb_basicsocket_getpeereid(mrb_state *mrb, mrb_value self)
 {
-#ifdef HAVE_GETPEEREID
   gid_t egid;
   uid_t euid;
   int s = socket_fd(mrb, self);
@@ -360,11 +382,11 @@ mrb_basicsocket_getpeereid(mrb_state *mrb, mrb_value self)
   mrb_ary_push(mrb, ary, mrb_fixnum_value((mrb_int)euid));
   mrb_ary_push(mrb, ary, mrb_fixnum_value((mrb_int)egid));
   return ary;
-#else
-  mrb_raise(mrb, E_RUNTIME_ERROR, "getpeereid is not available on this system");
-  return mrb_nil_value();
-#endif
 }
+#else
+/* unimplemented, and named as such so `respond_to?` can answer false */
+# define mrb_basicsocket_getpeereid mrb_notimplement_m
+#endif
 
 /*
  * call-seq:
@@ -579,14 +601,6 @@ socket_option_bool(mrb_state *mrb, mrb_value self)
   return mrb_bool_value((mrb_bool)i);
 }
 
-/* Helper to raise not implemented error for unimplemented Socket::Option methods */
-static mrb_value
-socket_option_notimp(mrb_state *mrb, mrb_value self)
-{
-  mrb_notimplement(mrb);
-  return mrb_nil_value();
-}
-
 /*
  * call-seq:
  *   socket_option.inspect -> string
@@ -668,6 +682,9 @@ mrb_basicsocket_recv(mrb_state *mrb, mrb_value self)
   mrb_int maxlen, flags = 0;
 
   mrb_get_args(mrb, "i|i", &maxlen, &flags);
+  if (maxlen < 0) {
+    mrb_raise(mrb, E_ARGUMENT_ERROR, "negative length");
+  }
 
   mrb_value buf = mrb_str_new_capa(mrb, maxlen);
   ssize_t n = recv(socket_fd(mrb, self), RSTRING_PTR(buf), (fsize_t)maxlen, (int)flags);
@@ -690,6 +707,9 @@ mrb_basicsocket_recvfrom(mrb_state *mrb, mrb_value self)
   mrb_int maxlen, flags = 0;
 
   mrb_get_args(mrb, "i|i", &maxlen, &flags);
+  if (maxlen < 0) {
+    mrb_raise(mrb, E_ARGUMENT_ERROR, "negative length");
+  }
 
   mrb_value buf = mrb_str_new_capa(mrb, maxlen);
   socklen_t socklen = sizeof(struct sockaddr_storage);
@@ -937,6 +957,9 @@ mrb_ipsocket_recvfrom(mrb_state *mrb, mrb_value self)
   mrb_int flags = 0;
 
   mrb_get_args(mrb, "i|i", &maxlen, &flags);
+  if (maxlen < 0) {
+    mrb_raise(mrb, E_ARGUMENT_ERROR, "negative length");
+  }
 
   mrb_value buf = mrb_str_new_capa(mrb, maxlen);
   struct sockaddr_storage ss;
@@ -1209,21 +1232,6 @@ mrb_tcpsocket_allocate(mrb_state *mrb, mrb_value klass)
 #ifdef _WIN32
 /*
  * call-seq:
- *   basicsocket.close -> nil
- *
- * Windows-specific implementation to close socket using closesocket().
- * Overrides IO#close for socket objects on Windows.
- */
-static mrb_value
-mrb_win32_basicsocket_close(mrb_state *mrb, mrb_value self)
-{
-  if (closesocket(socket_fd(mrb, self)) != NO_ERROR)
-    mrb_raise(mrb, E_SOCKET_ERROR, "closesocket unsuccessful");
-  return mrb_nil_value();
-}
-
-/*
- * call-seq:
  *   basicsocket.sysread(maxlen, outbuf=nil) -> string
  *
  * Windows-specific implementation to read from socket using recv().
@@ -1274,20 +1282,6 @@ mrb_win32_basicsocket_sysread(mrb_state *mrb, mrb_value self)
 
 /*
  * call-seq:
- *   basicsocket.sysseek(offset, whence) -> integer
- *
- * Windows-specific implementation that raises NotImplementedError.
- * Sockets don't support seeking operations.
- */
-static mrb_value
-mrb_win32_basicsocket_sysseek(mrb_state *mrb, mrb_value self)
-{
-  mrb_raise(mrb, E_NOTIMP_ERROR, "sysseek not implemented for windows sockets");
-  return mrb_nil_value();
-}
-
-/*
- * call-seq:
  *   basicsocket.syswrite(string) -> integer
  *
  * Windows-specific implementation to write to socket using send().
@@ -1328,9 +1322,13 @@ static const mrb_mt_entry basicsocket_rom_entries[] = {
   MRB_MT_ENTRY(mrb_basicsocket_shutdown,      MRB_SYM(shutdown), MRB_ARGS_OPT(1)),
   MRB_MT_ENTRY(mrb_basicsocket_set_is_socket, MRB_SYM_E(_is_socket), MRB_ARGS_REQ(1)),
 #ifdef _WIN32
-  MRB_MT_ENTRY(mrb_win32_basicsocket_close,    MRB_SYM(close), MRB_ARGS_NONE()),
+  /* `close` is IO's: fptr_finalize() calls closesocket() for a socket on
+     Windows and then clears the descriptor, which an override here did not,
+     leaving the object open to being closed a second time */
   MRB_MT_ENTRY(mrb_win32_basicsocket_sysread,  MRB_SYM(sysread), MRB_ARGS_REQ(1)|MRB_ARGS_OPT(1)),
-  MRB_MT_ENTRY(mrb_win32_basicsocket_sysseek,  MRB_SYM(sysseek), MRB_ARGS_REQ(1)),
+  /* a socket cannot seek: unimplemented, and named as such so `respond_to?`
+     can answer false */
+  MRB_MT_ENTRY(mrb_notimplement_m,             MRB_SYM(sysseek), MRB_ARGS_REQ(1)),
   MRB_MT_ENTRY(mrb_win32_basicsocket_syswrite, MRB_SYM(syswrite), MRB_ARGS_REQ(1)),
   MRB_MT_ENTRY(mrb_win32_basicsocket_sysread,  MRB_SYM(read), MRB_ARGS_REQ(1)|MRB_ARGS_OPT(1)),
   MRB_MT_ENTRY(mrb_win32_basicsocket_syswrite, MRB_SYM(write), MRB_ARGS_REQ(1)),
@@ -1350,8 +1348,9 @@ static const mrb_mt_entry socket_option_rom_entries[] = {
   MRB_MT_ENTRY(socket_option_data,    MRB_SYM(data),    MRB_ARGS_REQ(0)),
   MRB_MT_ENTRY(socket_option_bool,    MRB_SYM(bool),    MRB_ARGS_REQ(0)),
   MRB_MT_ENTRY(socket_option_int,     MRB_SYM(int),     MRB_ARGS_REQ(0)),
-  MRB_MT_ENTRY(socket_option_notimp,  MRB_SYM(linger),  MRB_ARGS_REQ(0)),
-  MRB_MT_ENTRY(socket_option_notimp,  MRB_SYM(unpack), MRB_ARGS_REQ(1)),
+  /* unimplemented, and named as such so `respond_to?` can answer false */
+  MRB_MT_ENTRY(mrb_notimplement_m,    MRB_SYM(linger),  MRB_ARGS_REQ(0)),
+  MRB_MT_ENTRY(mrb_notimplement_m,    MRB_SYM(unpack), MRB_ARGS_REQ(1)),
 };
 
 void

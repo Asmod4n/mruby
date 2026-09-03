@@ -52,18 +52,29 @@ mrb_nan_boxing_value_float(mrb_value v)
   return x.f;
 }
 
-#define SET_FLOAT_VALUE(mrb,r,f) do { \
+/* The union's members are named apart from the parameters: the preprocessor
+   substitutes a parameter wherever its name appears as a token, a member
+   position included, so a member named after a parameter turns an argument
+   such as `p->u.f` into a declaration of `mrb_float p->u.f`. */
+#define SET_FLOAT_VALUE(mrb,r,v) do { \
   union { \
-    mrb_float f; \
-    uint64_t u; \
+    mrb_float fval; \
+    uint64_t uval; \
   } float_uint_union; \
-  if ((f) != (f)) { /* NaN */ \
-    float_uint_union.u = 0x7ff8000000000000UL; \
+  if ((v) != (v)) { /* NaN */ \
+    /* A NaN is equal to nothing at all, its own operand included, so `==`
+       can never find one and a container searching for the NaN it holds has
+       only the object to go by. Each NaN takes a count of its own in the
+       payload, which the tag space leaves free: the tag saying which value
+       this is begins at bit 48, and everything below is the NaN's to spend.
+       `mrb_float()` reads any of these back as a NaN. */ \
+    float_uint_union.uval = 0x7ff8000000000000UL | \
+      (uint64_t)(mrb_nan_serial_next(mrb) & MRB_NAN_SERIAL_MAX); \
   } \
   else { \
-    float_uint_union.f = (f); \
+    float_uint_union.fval = (v); \
   } \
-  r.u = float_uint_union.u + 0x8004000000000000; \
+  (r).u = float_uint_union.uval + 0x8004000000000000; \
 } while(0)
 
 #define mrb_float_p(o) (((uint64_t)((o).u)&0xfffc000000000000) != 0)
@@ -164,7 +175,9 @@ MRB_API mrb_value mrb_boxing_int_value(mrb_state*, mrb_int);
 
 #define mrb_immediate_p(o) ((mrb_float_p(o) || mrb_nb_tt(o) != MRB_NANBOX_TT_OBJECT) || (o).u == 0)
 #define mrb_nil_p(o)  ((o).u == 0)
-#define mrb_false_p(o) (mrb_type(o) == MRB_TT_FALSE || (o).u == 0)
+/* `mrb_type` reports `MRB_TT_FALSE` for `nil` too, so the `nil` case has to be
+ * excluded here; the other boxings keep `nil` out of `mrb_false_p` as well. */
+#define mrb_false_p(o) (!mrb_nil_p(o) && mrb_type(o) == MRB_TT_FALSE)
 #define mrb_fixnum_p(o) (!mrb_float_p(o) && mrb_nb_tt(o)==MRB_NANBOX_TT_INTEGER)
 
 #endif  /* MRUBY_BOXING_NAN_H */

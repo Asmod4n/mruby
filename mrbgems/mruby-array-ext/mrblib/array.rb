@@ -16,6 +16,10 @@ class Array
   #    c.uniq! { |s| s.first } # => [["student", "sam"], ["teacher", "matz"]]
   #
   def uniq!(&block)
+    # The block form below answers nil without touching the array when it
+    # holds no duplicate, and __uniq! returns early for one element or none.
+    raise FrozenError, "can't modify frozen #{self.class}" if frozen?
+
     if block
       hash = {}
       result = []
@@ -155,6 +159,11 @@ class Array
     start, length = __fill_parse_arg(arg0, arg1, arg2, &block)
 
     if block
+      # A run of zero elements assigns nothing below, so nothing on this path
+      # asks whether the receiver may be written to. __fill_exec answers for
+      # the value form. Asked before the block runs, as CRuby does.
+      raise FrozenError, "can't modify frozen #{self.class}" if frozen?
+
       # Block-based filling in Ruby
       i = start
       while i < start + length
@@ -218,6 +227,9 @@ class Array
 
   def reject!(&block)
     return to_enum(:reject!) unless block
+    # Rejecting nothing skips the `replace` below, which is what would
+    # otherwise refuse a frozen receiver.
+    raise FrozenError, "can't modify frozen #{self.class}" if frozen?
 
     result = []
     idx = 0
@@ -390,6 +402,9 @@ class Array
 
   def select!(&block)
     return to_enum(:select!) unless block
+    # Keeping every element skips the `replace` below, which is what would
+    # otherwise refuse a frozen receiver.
+    raise FrozenError, "can't modify frozen #{self.class}" if frozen?
 
     result = []
     idx = 0
@@ -414,7 +429,7 @@ class Array
   # intermediate step is `nil`.
   #
   def dig(idx,*args)
-    idx = idx.__to_int
+    idx = Integer.__ensure(idx)
     n = self[idx]
     if args.size > 0
       n&.dig(*args)
@@ -498,7 +513,7 @@ class Array
 
     column_count = nil
     self.each do |row|
-      raise TypeError unless row.is_a?(Array)
+      raise TypeError unless Array === row
       column_count ||= row.size
       raise IndexError, 'element size differs' unless column_count == row.size
     end
@@ -628,7 +643,7 @@ class Array
   end
 
   def __combination(mode, k, &block)
-    k = k.__to_int
+    k = Integer.__ensure(k)
     return to_enum(mode, k) unless block
 
     case k
@@ -668,6 +683,39 @@ class Array
   #    [1, 2, 3, 4].find { |x| x > 10 }       #=> nil
   #    [1, 2, 3, 4].find(->{0}) { |x| x > 10 } #=> 0
   #
+  ##
+  # call-seq:
+  #   array.max -> element
+  #   array.max {|a, b| ... } -> element
+  #
+  # Returns the element of `self` that no other element is greater than.
+  #
+  # This is an optimized version of Enumerable#max for arrays: without a block
+  # the walk is made in C, where an Integer, a Float and a String are compared
+  # without a `<=>` send, as they are by Array#sort.
+  #
+  #    [3, 1, 2].max                    #=> 3
+  #    [3, 1, 2].max {|a, b| b <=> a }  #=> 1
+  #
+  def max(&block)
+    block ? super : __max
+  end
+
+  ##
+  # call-seq:
+  #   array.min -> element
+  #   array.min {|a, b| ... } -> element
+  #
+  # Returns the element of `self` that no other element is less than.
+  # See Array#max for how the two forms are walked.
+  #
+  #    [3, 1, 2].min                    #=> 1
+  #    [3, 1, 2].min {|a, b| b <=> a }  #=> 3
+  #
+  def min(&block)
+    block ? super : __min
+  end
+
   def find(ifnone=nil, &block)
     return to_enum(:find, ifnone) unless block
 

@@ -240,7 +240,14 @@ ary_make_shared(mrb_state *mrb, struct RArray *a)
 
     shared->refcnt = 1;
     if (a->as.heap.aux.capa > len) {
-      a->as.heap.ptr = shared->ptr = (mrb_value*)mrb_realloc(mrb, ptr, sizeof(mrb_value)*len+1);
+      /* Shrink to fit.  `len` can be zero here: a heap array emptied by
+         `pop` keeps the capacity it grew to, and mrb_ary_make_shared_copy()
+         brings such an array through.  mrb_realloc() with a size of zero
+         frees the buffer and answers NULL (see mrb_basic_alloc_func()), so
+         one element is asked for where there are none, keeping `ptr` a
+         pointer the shared array can be read and freed through. */
+      mrb_int size = len > 0 ? len : 1;
+      a->as.heap.ptr = shared->ptr = (mrb_value*)mrb_realloc(mrb, ptr, sizeof(mrb_value)*size);
     }
     else {
       shared->ptr = ptr;
@@ -468,6 +475,13 @@ mrb_ary_init(mrb_state *mrb, mrb_value ary)
   mrb_int size = mrb_as_int(mrb, ss);
   struct RArray *a = mrb_ary_ptr(ary);
 
+  /* Rebuilding an array through `initialize` writes over whatever it held,
+     and nothing below this point asks whether that is allowed: a size of
+     zero writes nothing at all, and the loop that fills a larger one writes
+     through no helper that checks. The branch above goes through
+     ary_replace(), which opens with the same check. */
+  ary_modify_check(mrb, a);
+
   if (ARY_CAPA(a) < size) {
     ary_expand_capa(mrb, a, size);
   }
@@ -646,6 +660,12 @@ mrb_ary_replace(mrb_state *mrb, mrb_value self, mrb_value other)
   if (a1 != a2) {
     ary_replace(mrb, a1, a2);
   }
+  else {
+    /* Replacing an array with itself leaves it as it was, so ary_replace()
+       and the frozen check it opens with are skipped. The call still asks to
+       write, and a frozen receiver answers FrozenError for it. */
+    ary_modify_check(mrb, a1);
+  }
 }
 
 /*
@@ -747,6 +767,12 @@ mrb_ary_reverse_bang(mrb_state *mrb, mrb_value self)
       *p1++ = *p2;
       *p2-- = tmp;
     }
+  }
+  else {
+    /* One element or none reverses into itself, so the ary_modify() above,
+       which is where a frozen receiver is turned away, is never reached.
+       The call is destructive at any length, so it is asked here. */
+    ary_modify_check(mrb, a);
   }
   return self;
 }
@@ -978,6 +1004,49 @@ mrb_ary_shift_m(mrb_state *mrb, mrb_value self)
   return val;
 }
 
+MRB_API mrb_value
+mrb_ary_unshift_values(mrb_state *mrb, mrb_value self,
+                       mrb_int argc, const mrb_value argv[])
+{
+  struct RArray *a = RARRAY(self);
+
+  if (argc == 0) {
+    ary_modify_check(mrb, a);
+    return self;
+  }
+
+  mrb_int len = ARY_LEN(a);
+  if (argc > ARY_MAX_SIZE - len) {
+    ary_too_big(mrb);
+  }
+
+  mrb_value *ptr = NULL;
+  if (ARY_SHARED_P(a)
+      && a->as.heap.aux.shared->refcnt == 1 /* shared only referenced from this array */
+      && a->as.heap.ptr - a->as.heap.aux.shared->ptr >= argc) /* there's room for unshifted items */ {
+    ary_modify_check(mrb, a);
+    a->as.heap.ptr -= argc;
+    ptr = a->as.heap.ptr;
+  }
+  else {
+    mrb_bool same = argv == ARY_PTR(a);
+    ary_modify(mrb, a);
+    if (ARY_CAPA(a) < len + argc)
+      ary_expand_capa(mrb, a, len + argc);
+    ptr = ARY_PTR(a);
+    value_move(ptr + argc, ptr, len);
+    if (same)
+      argv = ptr;
+  }
+  array_copy(ptr, argv, argc);
+  ARY_SET_LEN(a, len + argc);
+  while (argc--) {
+    mrb_field_write_barrier_value(mrb, (struct RBasic *)a, argv[argc]);
+  }
+
+  return self;
+}
+
 /* self = [1,2,3]
    item = 0
    self.unshift item
@@ -998,29 +1067,7 @@ mrb_ary_shift_m(mrb_state *mrb, mrb_value self)
 MRB_API mrb_value
 mrb_ary_unshift(mrb_state *mrb, mrb_value self, mrb_value item)
 {
-  struct RArray *a = mrb_ary_ptr(self);
-  mrb_int len = ARY_LEN(a);
-
-  if (ARY_SHARED_P(a)
-      && a->as.heap.aux.shared->refcnt == 1 /* shared only referenced from this array */
-      && a->as.heap.ptr - a->as.heap.aux.shared->ptr >= 1) /* there's room for unshifted item */ {
-    a->as.heap.ptr--;
-    a->as.heap.ptr[0] = item;
-  }
-  else {
-    mrb_value *ptr;
-
-    ary_modify(mrb, a);
-    if (ARY_CAPA(a) < len + 1)
-      ary_expand_capa(mrb, a, len + 1);
-    ptr = ARY_PTR(a);
-    value_move(ptr + 1, ptr, len);
-    ptr[0] = item;
-  }
-  ARY_SET_LEN(a, len+1);
-  mrb_field_write_barrier_value(mrb, (struct RBasic*)a, item);
-
-  return self;
+  return mrb_ary_unshift_values(mrb, self, 1, &item);
 }
 
 /*
@@ -1040,43 +1087,7 @@ mrb_ary_unshift(mrb_state *mrb, mrb_value self, mrb_value item)
 static mrb_value
 mrb_ary_unshift_m(mrb_state *mrb, mrb_value self)
 {
-  struct RArray *a = mrb_ary_ptr(self);
-  mrb_value *ptr;
-
-  mrb_int alen = mrb_get_argc(mrb);
-
-  if (alen == 0) {
-    ary_modify_check(mrb, a);
-    return self;
-  }
-  const mrb_value *vals = mrb_get_argv(mrb);
-  mrb_int len = ARY_LEN(a);
-  if (alen > ARY_MAX_SIZE - len) {
-    ary_too_big(mrb);
-  }
-  if (ARY_SHARED_P(a)
-      && a->as.heap.aux.shared->refcnt == 1 /* shared only referenced from this array */
-      && a->as.heap.ptr - a->as.heap.aux.shared->ptr >= alen) /* there's room for unshifted item */ {
-    ary_modify_check(mrb, a);
-    a->as.heap.ptr -= alen;
-    ptr = a->as.heap.ptr;
-  }
-  else {
-    mrb_bool same = vals == ARY_PTR(a);
-    ary_modify(mrb, a);
-    if (ARY_CAPA(a) < len + alen)
-      ary_expand_capa(mrb, a, len + alen);
-    ptr = ARY_PTR(a);
-    value_move(ptr + alen, ptr, len);
-    if (same) vals = ptr;
-  }
-  array_copy(ptr, vals, alen);
-  ARY_SET_LEN(a, len+alen);
-  while (alen--) {
-    mrb_field_write_barrier_value(mrb, (struct RBasic*)a, vals[alen]);
-  }
-
-  return self;
+  return mrb_ary_unshift_values(mrb, self, mrb_get_argc(mrb), mrb_get_argv(mrb));
 }
 
 /**
@@ -1197,6 +1208,14 @@ mrb_ary_splice(mrb_state *mrb, mrb_value ary, mrb_int head, mrb_int len, mrb_val
       }
       r = ary_dup(mrb, a);
       argv = ARY_PTR(r);
+      /* ary_dup -> ary_replace converts `a` to shared as a
+         copy-on-write optimization when len > ARY_REPLACE_SHARED_MIN.
+         Subsequent ARY_CAPA(a) reads would land on aux.shared's
+         pointer bits instead of the actual capacity, so the
+         expand-capa check below silently mis-sizes and value_move
+         walks past the buffer. Re-modify here to unshare before
+         mutating `a` in place. */
+      ary_modify(mrb, a);
     }
   }
   else if (mrb_undef_p(rpl)) {
@@ -1546,7 +1565,7 @@ mrb_ary_last(mrb_state *mrb, mrb_value self)
     return mrb_nil_value();
   }
 
-  mrb_int size = mrb_integer(mrb_get_arg1(mrb));
+  mrb_int size = mrb_as_int(mrb, mrb_get_arg1(mrb));
   if (size < 0) {
     mrb_raise(mrb, E_ARGUMENT_ERROR, "negative array size");
   }
@@ -1775,56 +1794,79 @@ mrb_ary_entry(mrb_value ary, mrb_int n)
 }
 
 static mrb_value
-join_ary(mrb_state *mrb, mrb_value ary, mrb_value sep, mrb_value list)
+join_ary(mrb_state *mrb, mrb_value ary, mrb_value sep)
 {
-  /* check recursive */
-  for (mrb_int i=0; i<RARRAY_LEN(list); i++) {
-    if (mrb_obj_equal(mrb, ary, RARRAY_PTR(list)[i])) {
-      mrb_raise(mrb, E_ARGUMENT_ERROR, "recursive array join");
-    }
-  }
-
-  mrb_ary_push(mrb, list, ary);
-
   mrb_value result = mrb_str_new_capa(mrb, 64);
+  /* Explicit stack of (array, index) frames instead of C recursion, so a
+     deeply nested (non-cyclic) array cannot overflow the native stack.
+     Nested results are concatenated verbatim, so appending every element
+     into one shared buffer in depth-first order yields the same bytes a
+     per-level recursion would.  The stack is a GC-tracked array; an
+     exception unwind reclaims it, so there is no leak. */
+  mrb_value stack = mrb_ary_new(mrb);
+  mrb_int idx = 0;
 
-  for (mrb_int i=0; i<RARRAY_LEN(ary); i++) {
-    if (i > 0 && !mrb_nil_p(sep)) {
-      mrb_str_cat_str(mrb, result, sep);
-    }
-
-    mrb_value val = RARRAY_PTR(ary)[i];
-
-    switch (mrb_type(val)) {
-    case MRB_TT_ARRAY:
-    ary_join:
-      val = join_ary(mrb, val, sep, list);
-      /* fall through */
-
-    case MRB_TT_STRING:
-    str_join:
-      mrb_str_cat_str(mrb, result, val);
-      break;
-
-    default:
-      if (!mrb_immediate_p(val)) {
-        mrb_value tmp = mrb_check_string_type(mrb, val);
-        if (!mrb_nil_p(tmp)) {
-          val = tmp;
-          goto str_join;
-        }
-        tmp = mrb_check_array_type(mrb, val);
-        if (!mrb_nil_p(tmp)) {
-          val = tmp;
-          goto ary_join;
-        }
+  for (;;) {
+    while (idx < RARRAY_LEN(ary)) {
+      mrb_value val = RARRAY_PTR(ary)[idx];
+      if (idx > 0 && !mrb_nil_p(sep)) {
+        mrb_str_cat_str(mrb, result, sep);
       }
-      val = mrb_obj_as_string(mrb, val);
-      goto str_join;
-    }
-  }
+      idx++;
 
-  mrb_ary_pop(mrb, list);
+      mrb_bool as_array = FALSE;
+      switch (mrb_type(val)) {
+      case MRB_TT_ARRAY:
+        as_array = TRUE;
+        break;
+
+      case MRB_TT_STRING:
+        break;
+
+      default:
+        if (!mrb_immediate_p(val)) {
+          mrb_value tmp = mrb_check_string_type(mrb, val);
+          if (!mrb_nil_p(tmp)) {
+            val = tmp;
+            break;
+          }
+          tmp = mrb_check_array_type(mrb, val);
+          if (!mrb_nil_p(tmp)) {
+            val = tmp;
+            as_array = TRUE;
+            break;
+          }
+        }
+        val = mrb_obj_as_string(mrb, val);
+        break;
+      }
+
+      if (as_array) {
+        /* check recursive: val must not be an ancestor on the current path */
+        if (mrb_obj_equal(mrb, val, ary)) {
+          mrb_raise(mrb, E_ARGUMENT_ERROR, "recursive array join");
+        }
+        for (mrb_int j = 0; j < RARRAY_LEN(stack); j += 2) {
+          if (mrb_obj_equal(mrb, val, RARRAY_PTR(stack)[j])) {
+            mrb_raise(mrb, E_ARGUMENT_ERROR, "recursive array join");
+          }
+        }
+        /* descend: save the current frame and switch to val */
+        mrb_ary_push(mrb, stack, ary);
+        mrb_ary_push(mrb, stack, mrb_fixnum_value(idx));
+        ary = val;
+        idx = 0;
+      }
+      else {
+        mrb_str_cat_str(mrb, result, val);
+      }
+    }
+
+    if (RARRAY_LEN(stack) == 0) break;
+    /* ascend: restore the parent frame */
+    idx = mrb_fixnum(mrb_ary_pop(mrb, stack));
+    ary = mrb_ary_pop(mrb, stack);
+  }
 
   return result;
 }
@@ -1849,7 +1891,7 @@ mrb_ary_join(mrb_state *mrb, mrb_value ary, mrb_value sep)
   if (!mrb_nil_p(sep)) {
     sep = mrb_obj_as_string(mrb, sep);
   }
-  return join_ary(mrb, ary, sep, mrb_ary_new(mrb));
+  return join_ary(mrb, ary, sep);
 }
 
 /*
@@ -1928,15 +1970,25 @@ mrb_ary_eq(mrb_state *mrb, mrb_value ary1)
   if (n == 1) return mrb_true_value();
   if (n == 0) return mrb_false_value();
 
-  /* Check for recursion */
+  /* A pair already being compared is taken as equal, as in CRuby's
+     recursive_equal(), and the other elements decide the outcome. */
   if (MRB_RECURSIVE_BINARY_FUNC_P(mrb, MRB_OPSYM(eq), ary1, ary2)) {
-    return mrb_false_value();
+    return mrb_true_value();
   }
 
   int ai = mrb_gc_arena_save(mrb);
   for (mrb_int i=0; i<RARRAY_LEN(ary1); i++) {
-    mrb_value eq = mrb_funcall_argv1(mrb, mrb_ary_entry(ary1, i), MRB_OPSYM(eq), mrb_ary_entry(ary2, i));
-    if (!mrb_test(eq)) return mrb_false_value();
+    /* `OP_EQ` takes two values for equal where they are the same object and
+       dispatches `==` only after, and so does the search `#index` and
+       `#delete` make. The same pair of steps is written out here rather than
+       reached through `mrb_equal()`, whose answer is the same one: the checks
+       it makes between them are all reached again by the dispatch below, and
+       the method lookup it adds is paid at every element. */
+    mrb_value a = mrb_ary_entry(ary1, i), b = mrb_ary_entry(ary2, i);
+    if (!mrb_obj_eq(mrb, a, b)) {
+      mrb_value eq = mrb_funcall_argv1(mrb, a, MRB_OPSYM(eq), b);
+      if (!mrb_test(eq)) return mrb_false_value();
+    }
     mrb_gc_arena_restore(mrb, ai);
   }
   return mrb_true_value();
@@ -1959,9 +2011,10 @@ mrb_ary_eql(mrb_state *mrb, mrb_value ary1)
   if (n == 1) return mrb_true_value();
   if (n == 0) return mrb_false_value();
 
-  /* Check for recursion */
+  /* A pair already being compared is taken as equal, as in CRuby's
+     recursive_equal(), and the other elements decide the outcome. */
   if (MRB_RECURSIVE_BINARY_FUNC_P(mrb, MRB_SYM_Q(eql), ary1, ary2)) {
-    return mrb_false_value();
+    return mrb_true_value();
   }
 
   int ai = mrb_gc_arena_save(mrb);
@@ -2232,6 +2285,35 @@ insertion_sort_str(mrb_state *mrb, mrb_value *a, mrb_int size)
   }
 }
 
+/* A comparison block answers with whatever object stands for the ordering it
+   found, and only one of those answers is an error. An Integer is its own
+   sign, big or small; `nil` is the block saying the pair has no order at all;
+   anything else is asked `> 0` and then `< 0`, and is a tie when neither
+   holds. That last arm is what lets a Float, or any object carrying the two
+   operators, order a sort, and it is the map `Enumerable#max` and `#min`
+   already read their own block through. It calls back into the VM, which is
+   the price of ordering by an object that answers only to sends; the Integer
+   arm ahead of it takes every block that returns `a <=> b`. */
+static mrb_int
+cmpint(mrb_state *mrb, mrb_value c, mrb_value a, mrb_value b)
+{
+  if (mrb_fixnum_p(c)) {
+    return mrb_fixnum(c);
+  }
+  if (mrb_nil_p(c)) {
+    mrb_raisef(mrb, E_ARGUMENT_ERROR, "comparison of %T with %T failed", a, b);
+  }
+#ifdef MRB_USE_BIGINT
+  if (mrb_bigint_p(c)) {
+    return mrb_bint_cmp(mrb, c, mrb_fixnum_value(0));
+  }
+#endif
+  mrb_value zero = mrb_fixnum_value(0);
+  if (mrb_test(mrb_funcall_argv1(mrb, c, MRB_OPSYM(gt), zero))) return 1;
+  if (mrb_test(mrb_funcall_argv1(mrb, c, MRB_OPSYM(lt), zero))) return -1;
+  return 0;
+}
+
 static mrb_bool
 sort_cmp(mrb_state *mrb, mrb_value ary, mrb_value a_val, mrb_value b_val, mrb_value blk)
 {
@@ -2252,7 +2334,14 @@ sort_cmp(mrb_state *mrb, mrb_value ary, mrb_value a_val, mrb_value b_val, mrb_va
         break;
 #ifndef MRB_NO_FLOAT
       case MRB_TT_FLOAT:
-        cmp = (mrb_float(a_val) > mrb_float(b_val)) ? 1 : (mrb_float(a_val) < mrb_float(b_val)) ? -1 : 0;
+        {
+          /* A NaN is greater than, less than and equal to nothing at all, so
+             the pair is reported as one that cannot be compared. Falling out
+             of the two tests below would call it a tie and leave the NaN
+             wherever the sort happened to put it. */
+          mrb_float a_flo = mrb_float(a_val), b_flo = mrb_float(b_val);
+          cmp = (a_flo > b_flo) ? 1 : (a_flo < b_flo) ? -1 : (a_flo == b_flo) ? 0 : -2;
+        }
         break;
 #endif
       case MRB_TT_STRING:
@@ -2266,21 +2355,25 @@ sort_cmp(mrb_state *mrb, mrb_value ary, mrb_value a_val, mrb_value b_val, mrb_va
     else {
       cmp = mrb_cmp(mrb, a_val, b_val);
     }
+    /* -2 is how the comparisons above report a pair they cannot order. It is
+       a value a block may answer with, so the test for it stays on this side
+       of the branch, where the answers are the ones written here. */
+    if (cmp == -2) {
+      mrb_gc_arena_restore(mrb, ai);
+      mrb_raise(mrb, E_ARGUMENT_ERROR, "comparison failed");
+    }
   }
   else {
     mrb_value args[2] = {a_val, b_val};
     mrb_value c = mrb_yield_argv(mrb, blk, 2, args);
-    if (mrb_nil_p(c) || !mrb_fixnum_p(c)) {
-      cmp = -2;
-    }
-    else {
-      cmp = mrb_fixnum(c);
-    }
+    /* The pair goes to `cmpint()` out of `args`, which the yield leaves as it
+       found it, rather than out of the parameters: one arm of the map calls
+       Ruby, and holding the two in registers across the yield so that arm can
+       reach them costs every comparison the sort makes, Integer answers
+       included. */
+    cmp = cmpint(mrb, c, args[0], args[1]);
   }
   mrb_gc_arena_restore(mrb, ai);
-  if (cmp == -2) {
-    mrb_raise(mrb, E_ARGUMENT_ERROR, "comparison failed");
-  }
   if (RARRAY_PTR(ary) != p || RARRAY_LEN(ary) != n) {
     mrb_raise(mrb, E_RUNTIME_ERROR, "array modified during sort");
   }
@@ -2390,7 +2483,13 @@ mrb_ary_sort_bang(mrb_state *mrb, mrb_value ary)
   mrb_value blk;
 
   mrb_int n = RARRAY_LEN(ary);
-  if (n < 2) return ary;
+  if (n < 2) {
+    /* Already sorted, so this returns without reaching the ary_modify()
+       below, which is where a frozen receiver would have been turned away.
+       The sort is a destructive call at any length, so it is asked here. */
+    ary_modify_check(mrb, mrb_ary_ptr(ary));
+    return ary;
+  }
 
   ary_modify(mrb, mrb_ary_ptr(ary));
   mrb_get_args(mrb, "&", &blk);

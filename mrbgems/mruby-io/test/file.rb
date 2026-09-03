@@ -23,9 +23,7 @@ end
 assert('File#initialize', '15.2.21.4.1') do
   io = File.open($mrbtest_io_rfname, "r")
   assert_nil io.close
-  assert_raise IOError do
-    io.close
-  end
+  assert_nil io.close
 end
 
 assert('File#path', '15.2.21.4.2') do
@@ -162,14 +160,13 @@ assert('File.extname') do
 end
 
 assert('File#flock') do
+  skip 'flock is not implemented on this platform' unless File.method_defined?(:flock)
   f = File.open $mrbtest_io_rfname
   begin
     assert_equal(f.flock(File::LOCK_SH), 0)
     assert_equal(f.flock(File::LOCK_UN), 0)
     assert_equal(f.flock(File::LOCK_EX | File::LOCK_NB), 0)
     assert_equal(f.flock(File::LOCK_UN), 0)
-  rescue NotImplementedError => e
-    skip e.message
   ensure
     f.close
   end
@@ -276,17 +273,11 @@ assert("File.readlink") do
 end
 
 assert("File.readlink fails with non-symlink") do
-  skip "readlink is not supported on this platform" if MRubyIOTestUtil.win?
   begin
     e2 = nil
-    assert_raise(RuntimeError) {
+    assert_raise(Errno::EINVAL) {
       begin
         File.readlink($mrbtest_io_rfname)
-      rescue => e
-        if Object.const_defined?(:SystemCallError) and e.kind_of?(SystemCallError)
-          raise RuntimeError, "SystemCallError converted to RuntimeError"
-        end
-        raise e
       rescue NotImplementedError => e
         e2 = e
       end
@@ -425,7 +416,7 @@ assert('File.open with "x" mode') do
   assert_nothing_raised do
     File.open($mrbtest_io_wfname, "wx") {}
   end
-  assert_raise(RuntimeError) do
+  assert_raise(Errno::EEXIST) do
     File.open($mrbtest_io_wfname, "wx") {}
   end
 
@@ -433,7 +424,7 @@ assert('File.open with "x" mode') do
   assert_nothing_raised do
     File.open($mrbtest_io_wfname, "w+x") {}
   end
-  assert_raise(RuntimeError) do
+  assert_raise(Errno::EEXIST) do
     File.open($mrbtest_io_wfname, "w+x") {}
   end
 

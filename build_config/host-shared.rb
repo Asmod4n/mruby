@@ -1,13 +1,12 @@
 # Build mruby with a shared libmruby.so (in addition to the usual
 # libmruby.a / executables).
 #
-# Produces (in build/host/lib/):
+# Produces (in build/host-shared/lib/):
 #   libmruby.a              the static archive (as in the default build)
 #   libmruby.so             the shared library, with SONAME=libmruby.so.<MAJOR>.<MINOR>
 #   libmruby.so.<MAJOR>.<MINOR>  symlink to libmruby.so (matches SONAME)
 #   libmruby.map            linker version script (MRUBY_<RELEASE_NO>)
 #
-# Also produces the matching libmruby_core.so + symlink for completeness.
 #
 # Symbol versioning ties to MRUBY_RELEASE_NO (e.g. MRUBY_40000 for 4.0.0).
 # mruby has historically had ABI breaks between TEENY versions, so the
@@ -15,7 +14,7 @@
 #
 # The shared library is built FROM the static archive via
 # `-Wl,--whole-archive`, so the existing static-build pipeline (including
-# the test infrastructure) is unaffected.  Executables in build/host/bin
+# the test infrastructure) is unaffected.  Executables in build/host-shared/bin
 # remain statically linked; distros that want dynamically-linked
 # executables can rebuild them against the .so.
 #
@@ -23,7 +22,9 @@
 
 require "mruby/source"
 
-MRuby::Build.new do |conf|
+# Shared-library build in a dedicated build directory (build/host-shared) so
+# it does not clobber a normal host build.
+MRuby::Build.new('host-shared') do |conf|
   conf.toolchain
 
   # include the GEM box
@@ -34,6 +35,7 @@ MRuby::Build.new do |conf|
     cc.flags << '-fPIC'
   end
 
+
   # Turn on `enable_debug` for better debugging
   conf.enable_debug
   conf.enable_bintest
@@ -43,7 +45,7 @@ end
 # Add the shared-library targets as a post-build pass, so the default
 # static-build pipeline remains untouched.
 MRuby.each_target do
-  next unless name == "host"
+  next unless name == "host-shared"
 
   libdir = File.join(build_dir, libdir_name)
   vermap = File.join(build_dir, "libmruby.map")
@@ -63,8 +65,7 @@ MRuby.each_target do
   minor = MRuby::Source::MRUBY_RELEASE_MINOR
 
   [
-    [libmruby_static,      "libmruby"],
-    [libmruby_core_static, "libmruby_core"],
+    [libmruby_static, "libmruby"],
   ].each do |archive, basename|
     so      = File.join(libdir, "#{basename}.so")
     symlink = "#{so}.#{major}.#{minor}"

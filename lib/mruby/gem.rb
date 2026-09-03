@@ -206,9 +206,14 @@ module MRuby
         end
       end
 
+      # The order of this list is the order of the members in `libmruby.a`.
+      # A glob of several extensions hands back one extension after another,
+      # and the sorting inside each of them is a default of `Dir` and not
+      # something asked for, so the order is settled here: the same sources
+      # then make the same archive, wherever it is built.
       def srcs_to_objs(src_dir_from_gem_dir)
         exts = compilers.flat_map{|c| c.source_exts} * ","
-        Dir["#{@dir}/#{src_dir_from_gem_dir}/*{#{exts}}"].map do |f|
+        Dir["#{@dir}/#{src_dir_from_gem_dir}/*{#{exts}}"].sort.map do |f|
           objfile(f.relative_path_from(@dir).to_s.pathmap("#{build_dir}/%X"))
         end
       end
@@ -240,43 +245,41 @@ module MRuby
       end
 
       def define_gem_init_builder
-        file "#{build_dir}/gem_init.c" => [build.mrbcfile, __FILE__] + [rbfiles].flatten do |t|
-          mkdir_p build_dir
-          generate_gem_init("#{build_dir}/gem_init.c")
+        fname = "#{build_dir}/gem_init.c"
+        generated_file fname, [build.mrbcfile, __FILE__] + [rbfiles].flatten, inputs: [cdump?, *objs] do |f|
+          _pp "GEN", fname.relative_path
+          generate_gem_init(f)
         end
       end
 
-      def generate_gem_init(fname)
-        _pp "GEN", fname.relative_path
-        open(fname, 'w') do |f|
-          print_gem_init_header f
-          unless rbfiles.empty?
-            opts = {cdump: cdump?, static: true}
-            if cdump?
-              build.mrbc.run f, rbfiles, "gem_mrblib_#{funcname}_proc", **opts
-            else
-              build.mrbc.run f, rbfiles, "gem_mrblib_irep_#{funcname}", **opts
-            end
+      def generate_gem_init(f)
+        print_gem_init_header f
+        unless rbfiles.empty?
+          opts = {cdump: cdump?, static: true}
+          if cdump?
+            build.mrbc.run f, rbfiles, "gem_mrblib_#{funcname}_proc", **opts
+          else
+            build.mrbc.run f, rbfiles, "gem_mrblib_irep_#{funcname}", **opts
           end
-          f.puts %Q[void mrb_#{funcname}_gem_init(mrb_state *mrb);]
-          f.puts %Q[void mrb_#{funcname}_gem_final(mrb_state *mrb);]
-          f.puts %Q[]
-          f.puts %Q[void GENERATED_TMP_mrb_#{funcname}_gem_init(mrb_state *mrb) {]
-          f.puts %Q[  gem_mrblib_#{funcname}_proc_init_syms(mrb);] if !rbfiles.empty? && cdump?
-          f.puts %Q[  mrb_#{funcname}_gem_init(mrb);] if objs != [objfile("#{build_dir}/gem_init")]
-          unless rbfiles.empty?
-            if cdump?
-              f.puts %Q[  mrb_load_proc(mrb, gem_mrblib_#{funcname}_proc);]
-            else
-              f.puts %Q[  mrb_load_irep(mrb, gem_mrblib_irep_#{funcname});]
-            end
-          end
-          f.puts %Q[}]
-          f.puts %Q[]
-          f.puts %Q[void GENERATED_TMP_mrb_#{funcname}_gem_final(mrb_state *mrb) {]
-          f.puts %Q[  mrb_#{funcname}_gem_final(mrb);] if objs != [objfile("#{build_dir}/gem_init")]
-          f.puts %Q[}]
         end
+        f.puts %Q[void mrb_#{funcname}_gem_init(mrb_state *mrb);]
+        f.puts %Q[void mrb_#{funcname}_gem_final(mrb_state *mrb);]
+        f.puts %Q[]
+        f.puts %Q[void GENERATED_TMP_mrb_#{funcname}_gem_init(mrb_state *mrb) {]
+        f.puts %Q[  gem_mrblib_#{funcname}_proc_init_syms(mrb);] if !rbfiles.empty? && cdump?
+        f.puts %Q[  mrb_#{funcname}_gem_init(mrb);] if objs != [objfile("#{build_dir}/gem_init")]
+        unless rbfiles.empty?
+          if cdump?
+            f.puts %Q[  mrb_load_proc(mrb, gem_mrblib_#{funcname}_proc);]
+          else
+            f.puts %Q[  mrb_load_irep(mrb, gem_mrblib_irep_#{funcname});]
+          end
+        end
+        f.puts %Q[}]
+        f.puts %Q[]
+        f.puts %Q[void GENERATED_TMP_mrb_#{funcname}_gem_final(mrb_state *mrb) {]
+        f.puts %Q[  mrb_#{funcname}_gem_final(mrb);] if objs != [objfile("#{build_dir}/gem_init")]
+        f.puts %Q[}]
       end # generate_gem_init
 
       def print_gem_comment(f)
@@ -422,6 +425,7 @@ module MRuby
 
       def initialize
         @ary = []
+        @removed = []
       end
 
       def each(&b)
@@ -439,6 +443,30 @@ module MRuby
         else
           # GEM was already added to this list
         end
+        self
+      end
+
+      # Remove the gem named +name+ and return it.  Naming a gem that
+      # is not in this build is a typo, not a no-op, so this fails;
+      # use +reject!+ when a predicate matching nothing is acceptable.
+      #
+      # A gem another gem declares as a dependency comes back during
+      # dependency resolution; setup_dependencies says so when it does.
+      def delete(name)
+        gem = self[name]
+        fail "Can't remove gem '#{name}'; it is not in this build" unless gem
+        @ary.delete(gem)
+        @removed << name
+        gem
+      end
+
+      # Remove every gem for which the block returns true.  Returns
+      # nil when nothing was removed, like Array#reject!.
+      def reject!(&block)
+        gone = @ary.select(&block)
+        return nil if gone.empty?
+        @ary -= gone
+        @removed.concat(gone.map(&:name))
         self
       end
 
@@ -486,18 +514,13 @@ module MRuby
         end
       end
 
-      def setup_build
-        each(&:setup_build)
-        self
-      end
-
       def setup_dependencies(build)
         gem_table = each_with_object({}) { |spec, h| h[spec.name] = spec }
 
         default_gems = {}
         each do |g|
           g.dependencies.each do |dep|
-            default_gems[dep[:gem]] ||= default_gem_params(dep)
+            default_gems[dep[:gem]] ||= default_gem_params(dep).merge(:required_by => g.name)
           end
         end
 
@@ -505,12 +528,18 @@ module MRuby
           def_name, def_gem = default_gems.shift
           next if gem_table[def_name]
 
+          # The build config asked for this one to go, but a gem that
+          # stayed cannot be built without it.  Say so rather than
+          # letting the removal look like it took.
+          warn "gem '#{def_name}' can't be removed; #{def_gem[:required_by]} depends on it" if
+            @removed.include?(def_name)
+
           spec = gem_table[def_name] = build.gem(def_gem[:default])
           fail "Invalid gem name: #{spec.name} (Expected: #{def_name})" if spec.name != def_name
           spec.setup
 
           spec.dependencies.each do |dep|
-            default_gems[dep[:gem]] ||= default_gem_params(dep)
+            default_gems[dep[:gem]] ||= default_gem_params(dep).merge(:required_by => spec.name)
           end
         end
 
@@ -584,6 +613,7 @@ module MRuby
 
         @ary = tsort_dependencies gem_table.keys, gem_table, true
 
+        each(&:setup_build)
         each(&:setup_compilers)
 
         each do |g|
@@ -621,8 +651,12 @@ module MRuby
       end
 
       def linker_attrs(gem=nil)
-        gems = self.reject{|g| g.bin?}  # library gems
-        gems << gem unless gem.nil?
+        # A gem that puts no object in libmruby.a contributes nothing to a link
+        # of it, so its linker options are its own binary's alone; ref #5210.
+        # One that does put objects there needs its options wherever libmruby.a
+        # is linked, whether or not it builds a binary as well.
+        gems = self.reject{|g| g.bin? && g.objs.empty?}
+        gems << gem unless gem.nil? || gems.include?(gem)
         gems.map{|g| g.linker.run_attrs}.transpose
       end
     end # List

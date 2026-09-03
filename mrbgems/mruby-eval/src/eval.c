@@ -145,7 +145,7 @@ eval_irep(mrb_state *mrb, mrb_value self, struct RProc *proc)
 
   /* no argument passed from eval() */
   ci->n = 0;
-  ci->nk = 0;
+  ci->kw = FALSE;
   /* clear visibility */
   MRB_CI_SET_VISIBILITY_BREAK(ci);
   /* clear block */
@@ -394,23 +394,15 @@ f_class_eval(mrb_state *mrb, mrb_value self)
 static mrb_value
 mrb_binding_eval(mrb_state *mrb, mrb_value binding)
 {
-  mrb_callinfo *ci = mrb->c->ci;
-  int argc = ci->n;
-  mrb_value *argv = ci->stack + 1;
-
-  if (argc < 15) {
-    argv[0] = mrb_ary_new_from_values(mrb, argc, argv);
-    argv[1] = argv[argc];       /* copy block */
-    ci->n = 15;
-  }
-  mrb_ary_splice(mrb, argv[0], 1, 0, binding); /* insert binding as 2nd argument */
+  mrb_value args = mrb_args_pack_positional(mrb);
+  mrb_ary_splice(mrb, args, 1, 0, binding); /* insert binding as 2nd argument */
   return f_eval(mrb, binding);
 }
 
 void
 mrb_mruby_eval_gem_init(mrb_state* mrb)
 {
-  mrb_define_private_method_id(mrb, mrb->kernel_module, MRB_SYM(eval), f_eval, MRB_ARGS_ARG(1, 3));
+  mrb_define_module_function_id(mrb, mrb->kernel_module, MRB_SYM(eval), f_eval, MRB_ARGS_ARG(1, 3));
   mrb_define_method_id(mrb, mrb_class_get_id(mrb, MRB_SYM(BasicObject)), MRB_SYM(instance_eval), f_instance_eval, MRB_ARGS_OPT(3)|MRB_ARGS_BLOCK());
   mrb_define_method_id(mrb, mrb->module_class, MRB_SYM(module_eval), f_class_eval, MRB_ARGS_OPT(3)|MRB_ARGS_BLOCK());
   mrb_define_method_id(mrb, mrb->module_class, MRB_SYM(class_eval), f_class_eval, MRB_ARGS_OPT(3)|MRB_ARGS_BLOCK());
