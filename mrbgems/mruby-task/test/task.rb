@@ -430,3 +430,12 @@ assert("closure escaping a synchronously executed proc survives GC") do
   assert_equal "sync-result", result
   $task_escaped_proc3 = nil
 end
+
+assert('mrb_task_disable refuses a VM that already has tasks') do
+  # A queue nobody ticks is a hang, not a saving, so the switch is only
+  # for a VM that has never had one. This VM has, so it must refuse - and
+  # must still be enabled afterwards.
+  Task.new { 1 }
+  assert_raise(RuntimeError) { TaskTest.disable_tasks }
+  assert_true TaskTest.tasks_enabled?
+end

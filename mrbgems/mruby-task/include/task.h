@@ -120,6 +120,11 @@ void mrb_task_mark_all(mrb_state *mrb);
  * Core task scheduler API
  */
 MRB_API void mrb_tick(mrb_state *mrb);
+
+/* Take a VM out of the scheduler for good; see task.c for what it saves.
+ * After mrb_open(), before anything runs. Raises if tasks already exist. */
+MRB_API void mrb_task_disable(mrb_state *mrb);
+MRB_API mrb_bool mrb_task_enabled_p(mrb_state *mrb);
 MRB_API mrb_value mrb_task_run(mrb_state *mrb);
 MRB_API mrb_value mrb_task_run_once(mrb_state *mrb);
 

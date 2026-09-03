@@ -26,6 +26,22 @@ tasktest_block_then_raise(mrb_state *mrb, mrb_value self)
   return mrb_nil_value(); /* not reached */
 }
 
+/* mrb_task_disable() is the embedder's call, so the test has to make it
+   from C. What Ruby can then check is the promise it makes: a VM that
+   already has tasks refuses, because a queue nobody ticks is a hang. */
+static mrb_value
+tasktest_disable_tasks(mrb_state *mrb, mrb_value self)
+{
+  mrb_task_disable(mrb);
+  return mrb_nil_value();
+}
+
+static mrb_value
+tasktest_tasks_enabled(mrb_state *mrb, mrb_value self)
+{
+  return mrb_bool_value(mrb_task_enabled_p(mrb));
+}
+
 /* Scheduler-hook probes. Two counters so the replace semantics can be
    observed: which counter grows tells which hook is installed. */
 static uint32_t probe_count_a;
@@ -271,6 +287,8 @@ void
 mrb_mruby_task_gem_test(mrb_state* mrb)
 {
   struct RClass *tasktest = mrb_define_module(mrb, "TaskTest");
+  mrb_define_module_function(mrb, tasktest, "disable_tasks", tasktest_disable_tasks, MRB_ARGS_NONE());
+  mrb_define_module_function(mrb, tasktest, "tasks_enabled?", tasktest_tasks_enabled, MRB_ARGS_NONE());
   mrb_define_module_function(mrb, tasktest, "block_then_raise", tasktest_block_then_raise, MRB_ARGS_REQ(1));
   mrb_define_module_function(mrb, tasktest, "install_probe_hook", tasktest_install_probe_hook, MRB_ARGS_REQ(1));
   mrb_define_module_function(mrb, tasktest, "probe_count", tasktest_probe_count, MRB_ARGS_REQ(1));

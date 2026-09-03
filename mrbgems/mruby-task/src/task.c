@@ -531,6 +531,33 @@ execute_task(mrb_state *mrb, mrb_task *t)
 }
 
 /* Tick handler - called by timer interrupt */
+/* Take this VM out of the scheduler for good.
+ *
+ * A process may hold VMs of both kinds - a pool whose workers run tasks
+ * so a runaway callback can be preempted, and one VM that never does.
+ * The second kind still paid for the first: RETURN_IF_TASK_STOPPED is
+ * expanded at every dispatch, and its context-status arm is read whether
+ * or not any task exists. Disabled, that check is one test of a word the
+ * dispatch loop already has.
+ *
+ * Call it after mrb_open() and before running anything. It refuses once
+ * tasks exist rather than stranding them, since a queue nobody ticks is
+ * a hang, not a saving. */
+MRB_API void
+mrb_task_disable(mrb_state *mrb)
+{
+  if (q_ready_ || q_waiting_ || q_suspended_ || q_dormant_) {
+    mrb_raise(mrb, E_RUNTIME_ERROR, "mrb_task_disable: this VM already has tasks");
+  }
+  mrb->task.enabled = FALSE;
+}
+
+MRB_API mrb_bool
+mrb_task_enabled_p(mrb_state *mrb)
+{
+  return mrb->task.enabled;
+}
+
 MRB_API void
 mrb_tick(mrb_state *mrb)
 {
@@ -1884,6 +1911,10 @@ mrb_mruby_task_gem_init(mrb_state *mrb)
 
   /* Initialize HAL (timer and interrupts) */
   mrb_hal_task_init(mrb);
+
+  /* On unless the embedder says otherwise: mrb_task_disable() is what a
+     VM that will never run tasks calls, right after mrb_open(). */
+  mrb->task.enabled = TRUE;
 
   /* Initialize main task to NULL and scheduler_lock to 0 */
   mrb->task.main_task = NULL;
